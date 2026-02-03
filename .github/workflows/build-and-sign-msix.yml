@@ -1,0 +1,111 @@
+name: Build and Sign MSIX (auto-detect)
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-and-sign:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Try to build (auto-detect .sln / .csproj)
+        shell: pwsh
+        run: |
+          $sln = Get-ChildItem -Path . -Filter *.sln -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          $csproj = Get-ChildItem -Path . -Filter *.csproj -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($sln) {
+            Write-Host "Found solution: $($sln.FullName). Building with msbuild (Release)..."
+            & msbuild $sln.FullName /p:Configuration=Release
+          } elseif ($csproj) {
+            Write-Host "Found csproj: $($csproj.FullName). Publishing with dotnet..."
+            & dotnet publish $csproj.FullName -c Release -o ./artifacts/publish
+          } else {
+            Write-Host "No .sln or .csproj found — skipping build. Ensure .msix files are present in the repo or produced earlier."
+          }
+          New-Item -ItemType Directory -Path ./artifacts -Force | Out-Null
+
+      - name: Find MSIX files (auto-detect)
+        id: find_msix
+        shell: pwsh
+        run: |
+          $msix = Get-ChildItem -Path . -Include *.msix -File -Recurse -ErrorAction SilentlyContinue
+          if (-not $msix) {
+            Write-Error "No .msix files found in repository or ./artifacts. Adjust build step or place .msix into repo/artifacts."
+            exit 1
+          }
+          $paths = $msix | Select-Object -ExpandProperty FullName
+          $joined = $paths -join '|'
+          Write-Host "Found MSIX files:`n$joined"
+          echo "::set-output name=files::$joined"
+
+      - name: Prepare certificate (use secret PFX if provided, otherwise create self-signed)
+        id: prepare_cert
+        shell: pwsh
+        env:
+          PFX_BASE64: ${{ secrets.MSIX_PFX_BASE64 }}
+          PFX_PASSWORD: ${{ secrets.MSIX_PFX_PASSWORD }}
+        run: |
+          if ($env:PFX_BASE64 -and $env:PFX_BASE64.Trim() -ne '') {
+            Write-Host "Using PFX from secrets"
+            [System.IO.File]::WriteAllBytes('certificate.pfx', [Convert]::FromBase64String($env:PFX_BASE64))
+            echo "::set-output name=pfxpath::certificate.pfx"
+            if ($env:PFX_PASSWORD) {
+              echo "::set-output name=pfxpass::$($env:PFX_PASSWORD)"
+            } else {
+              echo "::set-output name=pfxpass::"
+            }
+            exit 0
+          }
+
+          Write-Host "No PFX secret detected — creating a temporary self-signed code-signing certificate (for testing only)."
+          $pw = 'TempPfxPass123!'
+          $secure = ConvertTo-SecureString -String $pw -Force -AsPlainText
+          $cert = New-SelfSignedCertificate -Subject "CN=HDR-Controller-Temp-Sign" -Type CodeSigningCert -KeySpec Signature -CertStoreLocation Cert:\CurrentUser\My -NotAfter (Get-Date).AddYears(10)
+          Export-PfxCertificate -Cert "Cert:\CurrentUser\My\$($cert.Thumbprint)" -FilePath certificate.pfx -Password $secure
+          echo "::set-output name=pfxpath::certificate.pfx"
+          echo "::set-output name=pfxpass::$pw"
+
+      - name: Locate signtool.exe
+        id: signtool
+        shell: pwsh
+        run: |
+          $cmd = Get-Command signtool.exe -ErrorAction SilentlyContinue
+          if ($cmd) {
+            Write-Host "signtool in PATH: $($cmd.Path)"
+            echo "::set-output name=path::$($cmd.Path)"
+            exit 0
+          }
+          $found = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin' -Recurse -Filter signtool.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($found) {
+            Write-Host "Found signtool: $($found.FullName)"
+            echo "::set-output name=path::$($found.FullName)"
+            exit 0
+          }
+          Write-Error "signtool.exe not found on runner"
+          exit 1
+
+      - name: Sign MSIX files
+        shell: pwsh
+        env:
+          PFX_PASS_FROM_STEP: ${{ steps.prepare_cert.outputs.pfxpass }}
+        run: |
+          $signtool = "${{ steps.signtool.outputs.path }}"
+          if (-not $signtool) { Write-Error "signtool path missing"; exit 1 }
+          $files = "${{ steps.find_msix.outputs.files }}" -split '\|'
+          $pfx = "${{ steps.prepare_cert.outputs.pfxpath }}"
+          $pw = $env:PFX_PASS_FROM_STEP
+          foreach ($f in $files) {
+            Write-Host "Signing: $f"
+            & $signtool sign /fd SHA256 /f $pfx /p $pw /tr "http://timestamp.digicert.com" /td SHA256 $f
+            if ($LASTEXITCODE -ne 0) { Write-Error "signtool failed on $f (exit $LASTEXITCODE)"; exit $LASTEXITCODE }
+          }
+
+      - name: Upload signed MSIX files as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-msix
+          path: ${{ steps.find_msix.outputs.files }}

@@ -58,16 +58,26 @@ jobs:
             } else {
               echo "::set-output name=pfxpass::"
             }
+            echo "::set-output name=from_secret::true"
             exit 0
           }
 
           Write-Host "No PFX secret detected — creating a temporary self-signed code-signing certificate (for testing only)."
-          $pw = 'TempPfxPass123!'
+          $pw = '0135'
           $secure = ConvertTo-SecureString -String $pw -Force -AsPlainText
           $cert = New-SelfSignedCertificate -Subject "CN=HDR-Controller-Temp-Sign" -Type CodeSigningCert -KeySpec Signature -CertStoreLocation Cert:\CurrentUser\My -NotAfter (Get-Date).AddYears(10)
           Export-PfxCertificate -Cert "Cert:\CurrentUser\My\$($cert.Thumbprint)" -FilePath certificate.pfx -Password $secure
           echo "::set-output name=pfxpath::certificate.pfx"
           echo "::set-output name=pfxpass::$pw"
+          echo "::set-output name=from_secret::false"
+
+      - name: Upload certificate.pfx (testing only)
+        if: steps.prepare_cert.outputs.from_secret == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: signing-certificate
+          path: certificate.pfx
+          retention-days: 1
 
       - name: Locate signtool.exe
         id: signtool
